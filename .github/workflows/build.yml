@@ -125,7 +125,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: UniXNU/uefi-sheng
-          ref: main
+          ref: 20ac23d5e0937106c2129303dfc931b3390ae660
           path: uefi-sheng
           submodules: recursive
 
