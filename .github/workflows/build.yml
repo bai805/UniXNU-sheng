@@ -1,0 +1,427 @@
+name: macOS 构建
+
+# 全部步骤都在 GitHub 的 macOS runner 上运行，不依赖 Linux 工具链。
+# 该文件只做流程编排，不新增任何仓库内脚本或代码文件。
+# sheng 的 VerifiedRoot 归档、trust cache 和 Data seed 仍需由输入提供。
+
+'on':
+  workflow_dispatch:
+    inputs:
+      device_repository:
+        description: 设备仓库，格式 owner/name
+        required: true
+        default: UniXNU/UniXNU-sheng
+      device_ref:
+        description: 设备仓库的 ref，例如 main 或你的分支
+        required: true
+        default: main
+      unixnu_ref:
+        description: UniXNU 主仓库的 ref
+        required: true
+        default: main
+      defconfig:
+        description: 设备仓库 configs/ 下的 defconfig 名称
+        required: true
+        default: sheng_defconfig
+      steps:
+        description: 要构建的步骤；package/firmware/bootimg 用于完整镜像链
+        type: choice
+        options:
+          - kernel
+          - kernel payload
+          - kernel userdata
+          - kernel userdata payload
+          - kernel package firmware
+          - kernel package firmware payload
+          - kernel package firmware payload bootimg
+        default: kernel
+      xcode:
+        description: macos-26 镜像中的 Xcode 版本（/Applications/Xcode_<version>.app）
+        required: true
+        default: "26.6"
+      ipsw_url:
+        description: IPSW URL；留空则使用 board.toml/profile 中的地址
+        required: false
+        default: ""
+      pre_build:
+        description: 内核构建前在 UniXNU 根目录执行的 shell 命令；真实 VerifiedRoot 归档从这里放入
+        required: false
+        default: ""
+      trust_cache_url:
+        description: trust cache bundle 的直链；会在日志中遮蔽
+        required: false
+        default: ""
+      owner_trust_cache:
+        description: 将 trust_cache_url 视为 owner-signed bundle
+        type: boolean
+        default: false
+      data_seed_url:
+        description: Data seed（.dbr）的直链；会在日志中遮蔽
+        required: false
+        default: ""
+      grow_gib:
+        description: 将 Data seed 扩容到指定 GiB；只在提供 Data seed 时使用
+        required: false
+        default: ""
+      skip_setup:
+        description: 在 Data seed 中标记 Setup 已完成；必须提供 Data seed
+        type: boolean
+        default: false
+      panic_screen:
+        description: 是否把 panic screen 打进 payload 内核；当前 sheng 内核默认关闭
+        type: boolean
+        default: false
+      upload_artifacts:
+        description: 上传 kernel、payload 和 boot image；默认只上传脱敏日志
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-build-${{ github.ref }}-${{ inputs.device_repository }}-${{ inputs.device_ref }}-${{ inputs.defconfig }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ENV_HINTS: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # macos-26 为 arm64，自带 Xcode 26 工具链；如需其它镜像自行修改这里。
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ inputs.xcode }}.app/Contents/Developer
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+      UNIXNU_IPSW: ${{ inputs.ipsw_url }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      STEPS: ${{ inputs.steps }}
+
+    steps:
+      - name: 检出 UniXNU 主仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ inputs.unixnu_ref }}
+          persist-credentials: false
+
+      - name: 检出设备仓库
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.device_repository }}
+          ref: ${{ inputs.device_ref }}
+          path: device
+          token: ${{ secrets.UNIXNU_DEVICE_TOKEN || github.token }}
+
+      - name: 检出 uefi-sheng
+        if: contains(inputs.steps, 'firmware') || contains(inputs.steps, 'bootimg')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: UniXNU/uefi-sheng
+          ref: main
+          path: uefi-sheng
+          submodules: recursive
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: 检查输入
+        id: check
+        env:
+          HAS_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID != '' }}
+          OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
+          GROW_GIB: ${{ inputs.grow_gib }}
+          SKIP_SETUP: ${{ inputs.skip_setup }}
+        run: |
+          # URL 可能包含访问令牌，先读取并遮蔽，再进入任何会打印环境变量的步骤。
+          trust_cache_url=$(jq -r '.inputs.trust_cache_url // ""' "$GITHUB_EVENT_PATH")
+          data_seed_url=$(jq -r '.inputs.data_seed_url // ""' "$GITHUB_EVENT_PATH")
+          if [ -n "$trust_cache_url" ]; then echo "::add-mask::$trust_cache_url"; fi
+          if [ -n "$data_seed_url" ]; then echo "::add-mask::$data_seed_url"; fi
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ -f device/board.toml ] || fail "设备仓库没有 board.toml"
+          [ -f "device/configs/$DEFCONFIG" ] || fail "找不到 device/configs/$DEFCONFIG"
+          [ -d "$DEVELOPER_DIR" ] || fail "找不到 Xcode：$DEVELOPER_DIR"
+          if [ -n "$GROW_GIB" ] && ! [[ "$GROW_GIB" =~ ^[0-9]+$ ]]; then
+            fail "grow_gib 必须是整数"
+          fi
+          if [ -n "$GROW_GIB" ] && [ -z "$data_seed_url" ]; then
+            fail "grow_gib 需要 data_seed_url"
+          fi
+          if [ "$SKIP_SETUP" = true ] && [ -z "$data_seed_url" ]; then
+            fail "skip_setup 需要 data_seed_url"
+          fi
+          if [ "$OWNER_TRUST_CACHE" = true ] && [ -z "$trust_cache_url" ]; then
+            fail "owner_trust_cache 需要 trust_cache_url"
+          fi
+          if [[ "$STEPS" != *payload* ]] && { [ -n "$trust_cache_url" ] || [ -n "$data_seed_url" ] || [ "$SKIP_SETUP" = true ]; }; then
+            fail "trust_cache_url、data_seed_url 和 skip_setup 只适用于 payload"
+          fi
+          if [[ "$STEPS" == *bootimg* ]]; then
+            [[ "$STEPS" == *firmware* ]] || fail "bootimg 需要 firmware"
+            [[ "$STEPS" == *payload* ]] || fail "bootimg 需要 payload"
+          fi
+
+          python3 - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, 'scripts')
+          from unixnu.cli import parser, cmd_defconfig
+          from unixnu.config import Context
+
+          ctx = Context(parser().parse_args(['defconfig', os.environ['DEFCONFIG']]))
+          cmd_defconfig(ctx)
+          board = ctx.board
+          name = board.get('board', {}).get('name')
+          if not name:
+              sys.exit('::error::board.toml 缺少 [board] name')
+
+          adt = board.get('payload', {}).get('adt', {})
+          if 'payload' in os.environ['STEPS'] and adt.get('unique_chip_id') == 'required' and os.environ['HAS_CHIP_ID'] != 'true':
+              sys.exit('::error::该设备构建 payload 需要仓库 Secret UNIXNU_UNIQUE_CHIP_ID')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'board={name}\n')
+              out.write(f'work={ctx.work}\n')
+          PY
+
+      - name: 安装 Homebrew 工具
+        run: |
+          # cmake/ninja 由镜像提供；LLVM 仅给 archive 构建器使用。
+          brew install llvm lld mtools dtc nasm acpica
+          if ! command -v unifdef >/dev/null; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: 输出工具链信息
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --find mig
+          clang --version | sed -n '1p'
+          "$(brew --prefix llvm)/bin/clang" --version | sed -n '1p'
+          python3 --version
+          missing=0
+          for tool in git make clang cmake ninja unifdef ld.lld mformat mcopy dtc nasm iasl xcodebuild; do
+            path=$(command -v "$tool" || true)
+            printf '%-10s %s\n' "$tool" "${path:-MISSING}"
+            [ -n "$path" ] || missing=1
+          done
+          df -h "$GITHUB_WORKSPACE"
+          exit "$missing"
+
+      - name: 准备 payload 输入
+        if: contains(inputs.steps, 'payload')
+        env:
+          GROW_GIB: ${{ inputs.grow_gib }}
+        run: |
+          trust_cache_url=$(jq -r '.inputs.trust_cache_url // ""' "$GITHUB_EVENT_PATH")
+          data_seed_url=$(jq -r '.inputs.data_seed_url // ""' "$GITHUB_EVENT_PATH")
+
+          if [ -n "$trust_cache_url" ]; then
+            curl -fsSL --retry 3 "$trust_cache_url" -o "$RUNNER_TEMP/trustcache"
+          fi
+          if [ -n "$data_seed_url" ]; then
+            curl -fsSL --retry 3 "$data_seed_url" -o "$RUNNER_TEMP/data.dbr"
+            if [ -n "$GROW_GIB" ]; then
+              git submodule update --init --depth 1 drivers/DarwinBoot
+              mkdir -p build
+              python3 scripts/seed-data-grow.py --gib "$GROW_GIB" \
+                "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
+              mv "$RUNNER_TEMP/data-grow.dbr" "$RUNNER_TEMP/data.dbr"
+            fi
+          fi
+
+      - name: 设置 panic screen
+        if: contains(inputs.steps, 'payload')
+        env:
+          PANIC_SCREEN: ${{ inputs.panic_screen }}
+        run: |
+          # sheng 当前真实策略内核的 cave 不够，默认关闭；如需开启，自行确认空间。
+          if [ "$PANIC_SCREEN" = false ]; then
+            sed -i '' 's/"panic_screen" = true/"panic_screen" = false/' device/board.toml
+          fi
+
+      - name: 运行 pre_build
+        if: inputs.pre_build != ''
+        env:
+          PRE_BUILD: ${{ inputs.pre_build }}
+          DEVICE_DIR: ${{ github.workspace }}/device
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash -euo pipefail -c "$PRE_BUILD"
+
+      - name: 构建内核
+        id: kernel
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./unixnu build kernel
+
+      - name: 构建 package
+        id: package
+        if: contains(inputs.steps, 'package')
+        env:
+          UNIXNU_UEFI: ${{ github.workspace }}/uefi-sheng
+        run: ./unixnu build package --uefi "$UNIXNU_UEFI"
+
+      - name: 构建 firmware
+        id: firmware
+        if: contains(inputs.steps, 'firmware')
+        env:
+          UNIXNU_UEFI: ${{ github.workspace }}/uefi-sheng
+        run: ./unixnu build firmware --uefi "$UNIXNU_UEFI"
+
+      - name: 构建 userdata
+        id: userdata
+        if: contains(inputs.steps, 'userdata')
+        run: |
+          ./unixnu build userdata
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: 构建 payload
+        id: payload
+        if: contains(inputs.steps, 'payload')
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          SKIP_SETUP: ${{ inputs.skip_setup }}
+          OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
+        run: |
+          args=()
+          if [ -f "$RUNNER_TEMP/trustcache" ]; then
+            if [ "$OWNER_TRUST_CACHE" = true ]; then
+              args+=(--owner-trust-cache "$RUNNER_TEMP/trustcache")
+            else
+              args+=(--trust-cache "$RUNNER_TEMP/trustcache")
+            fi
+          fi
+          if [ -f "$RUNNER_TEMP/data.dbr" ]; then
+            args+=(--data-ramdisk "$RUNNER_TEMP/data.dbr")
+          fi
+          if [ "$SKIP_SETUP" = true ]; then
+            args+=(--skip-setup)
+          fi
+          ./unixnu build payload "${args[@]}"
+
+      - name: 构建启动镜像
+        id: bootimg
+        if: contains(inputs.steps, 'bootimg')
+        env:
+          UNIXNU_UEFI: ${{ github.workspace }}/uefi-sheng
+          BOARD_WORK: ${{ steps.check.outputs.work }}
+        run: |
+          ./unixnu bootimg --uefi "$UNIXNU_UEFI" \
+            --dtb "$BOARD_WORK/tree/build/sheng/sheng.dtb" \
+            -o "$BOARD_WORK/boot.img"
+
+      - name: 上传设备产物
+        if: inputs.upload_artifacts && success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-${{ steps.check.outputs.board }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.check.outputs.work }}/kernel/kernel.macho
+            ${{ steps.check.outputs.work }}/payload/payload.img
+            ${{ steps.check.outputs.work }}/boot.img
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 收集文本日志
+        id: logs
+        if: always() && steps.check.outcome == 'success'
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          BOARD: ${{ steps.check.outputs.board }}
+          WORK: ${{ steps.check.outputs.work }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          source = Path(os.environ['WORK']) / 'logs'
+          target = Path(os.environ['RUNNER_TEMP']) / 'public-logs'
+          shutil.rmtree(target, ignore_errors=True)
+          target.mkdir(parents=True)
+
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          inputs = event.get('inputs', {})
+          secrets = [
+              os.environ.get('UNIXNU_UNIQUE_CHIP_ID', ''),
+              inputs.get('trust_cache_url', ''),
+              inputs.get('data_seed_url', ''),
+          ]
+          secrets = [value for value in secrets if value]
+
+          count = 0
+          for path in sorted(source.glob('*.log')) if source.is_dir() else []:
+              data = path.read_bytes()
+              if b'\0' in data:
+                  continue
+              text = data.decode('utf-8', 'replace')
+              for value in secrets:
+                  text = text.replace(value, '***')
+              text = re.sub(
+                  r'https?://[^\s"\']*[?&](?:token|sig|signature|key|X-Amz-Signature)=[^\s"\']*',
+                  '***', text, flags=re.I)
+              (target / path.name).write_text(text)
+              count += 1
+          print(f'已收集 {count} 个文本日志')
+          PY
+
+      - name: 上传构建日志
+        if: always() && steps.logs.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unixnu-${{ steps.check.outputs.board }}-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/public-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 汇总
+        if: always()
+        env:
+          BOARD: ${{ steps.check.outputs.board }}
+          KERNEL: ${{ steps.kernel.outcome }}
+          PACKAGE: ${{ steps.package.outcome }}
+          FIRMWARE: ${{ steps.firmware.outcome }}
+          USERDATA: ${{ steps.userdata.outcome }}
+          PAYLOAD: ${{ steps.payload.outcome }}
+          BOOTIMG: ${{ steps.bootimg.outcome }}
+        run: |
+          {
+            echo "## macOS 构建：${BOARD:-unknown} (${DEFCONFIG}, ${STEPS})"
+            echo
+            echo "| 步骤 | 结果 |"
+            echo "| --- | --- |"
+            echo "| kernel | ${KERNEL:-skipped} |"
+            echo "| package | ${PACKAGE:-skipped} |"
+            echo "| firmware | ${FIRMWARE:-skipped} |"
+            echo "| userdata | ${USERDATA:-skipped} |"
+            echo "| payload | ${PAYLOAD:-skipped} |"
+            echo "| bootimg | ${BOOTIMG:-skipped} |"
+            echo
+            echo "全部构建步骤运行在 macOS；只有开启 upload_artifacts 才上传设备产物。"
+            xcodebuild -version
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 清理专有输入
+        if: always()
+        run: |
+          rm -rf out/ipsw out/feeds device/.cache/firmware \
+            out/*/tree/.cache/firmware out/*/payload/data-skip-setup-* \
+            out/*/*/*/tree/.cache/firmware out/*/*/*/payload/data-skip-setup-*
+          rm -f "$RUNNER_TEMP/trustcache" "$RUNNER_TEMP/data.dbr" "$RUNNER_TEMP/data-grow.dbr"
