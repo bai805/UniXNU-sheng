@@ -34,6 +34,7 @@ name: macOS 构建
           - kernel package firmware
           - kernel package firmware payload
           - kernel package firmware payload bootimg
+          - kernel package firmware payload bootimg userdata
         default: kernel
       xcode:
         description: macos-26 镜像中的 Xcode 版本（/Applications/Xcode_<version>.app）
@@ -344,6 +345,8 @@ jobs:
             ${{ steps.check.outputs.work }}/kernel/kernel.macho
             ${{ steps.check.outputs.work }}/payload/payload.img
             ${{ steps.check.outputs.work }}/boot.img
+            ${{ steps.check.outputs.work }}/userdata/userdata-root.img
+            ${{ steps.check.outputs.work }}/userdata/userdata-root.json
           if-no-files-found: ignore
           retention-days: 7
 
