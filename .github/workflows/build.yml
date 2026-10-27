@@ -43,6 +43,11 @@ name: macOS 构建
         description: IPSW URL；留空则使用 board.toml/profile 中的地址
         required: false
         default: ""
+      unique_chip_id:
+        description: 平台种子（1-16 位十六进制）；留空则使用仓库 Secret UNIXNU_UNIQUE_CHIP_ID
+        type: string
+        required: false
+        default: ""
       pre_build:
         description: 内核构建前在 UniXNU 根目录执行的 shell 命令；真实 VerifiedRoot 归档从这里放入
         required: false
@@ -136,7 +141,7 @@ jobs:
       - name: 检查输入
         id: check
         env:
-          HAS_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID != '' }}
+          HAS_CHIP_ID: ${{ inputs.unique_chip_id != '' || secrets.UNIXNU_UNIQUE_CHIP_ID != '' }}
           OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
           GROW_GIB: ${{ inputs.grow_gib }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
@@ -144,10 +149,15 @@ jobs:
           # URL 可能包含访问令牌，先读取并遮蔽，再进入任何会打印环境变量的步骤。
           trust_cache_url=$(jq -r '.inputs.trust_cache_url // ""' "$GITHUB_EVENT_PATH")
           data_seed_url=$(jq -r '.inputs.data_seed_url // ""' "$GITHUB_EVENT_PATH")
+          unique_chip_id=$(jq -r '.inputs.unique_chip_id // ""' "$GITHUB_EVENT_PATH")
           if [ -n "$trust_cache_url" ]; then echo "::add-mask::$trust_cache_url"; fi
           if [ -n "$data_seed_url" ]; then echo "::add-mask::$data_seed_url"; fi
+          if [ -n "$unique_chip_id" ]; then echo "::add-mask::$unique_chip_id"; fi
 
           fail() { echo "::error::$1"; exit 1; }
+          if [ -n "$unique_chip_id" ] && ! [[ "$unique_chip_id" =~ ^[0-9a-fA-F]{1,16}$ ]]; then
+            fail "unique_chip_id 必须是 1-16 位十六进制数"
+          fi
 
           [ -f device/board.toml ] || fail "设备仓库没有 board.toml"
           [ -f "device/configs/$DEFCONFIG" ] || fail "找不到 device/configs/$DEFCONFIG"
@@ -188,7 +198,7 @@ jobs:
 
           adt = board.get('payload', {}).get('adt', {})
           if 'payload' in os.environ['STEPS'] and adt.get('unique_chip_id') == 'required' and os.environ['HAS_CHIP_ID'] != 'true':
-              sys.exit('::error::该设备构建 payload 需要仓库 Secret UNIXNU_UNIQUE_CHIP_ID')
+              sys.exit('::error::该设备构建 payload 需要 unique_chip_id 输入或仓库 Secret UNIXNU_UNIQUE_CHIP_ID')
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f'board={name}\n')
@@ -294,7 +304,7 @@ jobs:
         id: payload
         if: contains(inputs.steps, 'payload')
         env:
-          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          UNIXNU_UNIQUE_CHIP_ID: ${{ inputs.unique_chip_id || secrets.UNIXNU_UNIQUE_CHIP_ID }}
           SKIP_SETUP: ${{ inputs.skip_setup }}
           OWNER_TRUST_CACHE: ${{ inputs.owner_trust_cache }}
         run: |
@@ -341,7 +351,7 @@ jobs:
         id: logs
         if: always() && steps.check.outcome == 'success'
         env:
-          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          UNIXNU_UNIQUE_CHIP_ID: ${{ inputs.unique_chip_id || secrets.UNIXNU_UNIQUE_CHIP_ID }}
           BOARD: ${{ steps.check.outputs.board }}
           WORK: ${{ steps.check.outputs.work }}
         run: |
@@ -361,6 +371,7 @@ jobs:
           inputs = event.get('inputs', {})
           secrets = [
               os.environ.get('UNIXNU_UNIQUE_CHIP_ID', ''),
+              inputs.get('unique_chip_id', ''),
               inputs.get('trust_cache_url', ''),
               inputs.get('data_seed_url', ''),
           ]
